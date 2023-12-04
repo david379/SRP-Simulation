@@ -1,0 +1,381 @@
+%% PREAMBLE
+
+clear;
+cd(fileparts(mfilename('fullpath')));
+addpath(genpath(pwd));
+
+% run("icogrid.m");
+% run("randPoints.m")
+% run("mic_array_maker.m")
+% run("DOA_Delta.m")
+
+
+%% CONFIGURATION
+
+%%% ACOUSTIC SETUP
+% speed of sound
+c = 343;
+% sample rate
+fs = 32000;
+% bandlimit
+w_0 = pi*fs * 32 / 32;
+% SNR in dB
+% SNR = 0;
+noise_mul = -20; %in dB
+
+%%% SOURCE LOCATIONS
+tmp = load('randLoc.mat');
+true_loc = tmp.true_loc;
+
+% circ_rad = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 1, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9, 2, 2.5, 3, 3.5, 4];
+% circ_rad = [0.35, 0.5, 0.6, 0.75];
+circ_rad = [0.3, 0.5];
+SNR_dyn_mat = zeros(size(circ_rad, 2), size(true_loc, 1));
+circ_err = zeros(size(circ_rad, 2), size(true_loc, 1));
+circ_err_mean = zeros(size(circ_rad));
+
+
+for circ = 1:size(circ_rad, 2)
+
+
+    %%% MICROPHONE ARRAY
+    
+    mic_config = ['circle_' num2str(circ_rad(circ)) '_pairs_mic_array'];
+%     mic_config = 'circle_0.75_pairs_mic_array';
+    tmp = load(fullfile("data/mic_arrays", [mic_config '.mat']));
+    
+    
+    % array center
+    arrayCenterPos = tmp.arrayCenterPos;
+    dist_mat = tmp.dist_mat;
+    % microphone positions
+    micPos = tmp.micPos;
+    % number of microphones
+    M = size(micPos,1);
+    P = M*(M-1)/2;
+
+    tmp = load(fullfile("data/DOAs", ['DOA_' num2str(circ_rad(circ)) '_pairs_mic_array.mat']));
+%     tmp = load(fullfile("data/DOAs", 'DOA.mat'));
+    DOAvec_list = tmp.DOA_list;
+    Delta_t_list = tmp.Delta_list;
+
+    %%% SOURCE LOCATIONS
+%     randPoints();
+    tmp = load('randLoc.mat');
+    true_loc = tmp.true_loc;
+    % compute ground truth DOA vectors for source locations
+    true_DOAvec = calc_DOA(true_loc, arrayCenterPos);
+       
+    % number of processed frames per location
+    L = 1; %32;
+    %%% STFT PARAMETERS
+    win_time = 0.05; % 50ms
+    % window size
+    N_STFT = fs * win_time; %28800; %39690; %21608; %55998; %547840; %8192; %2048;
+    % shift
+    R_STFT = N_STFT/2;
+    % window
+    win = sqrt(hann(N_STFT,'periodic'));
+    N_STFT_half = floor(N_STFT/2)+1;
+    % frequency vector
+    omega = 2*pi*linspace(0,fs/2,N_STFT_half).';
+
+    % disp(['PRE-PROCESSING']);
+    % tic;
+    % %%% CANDIDATE LOCATIONS
+    % % polar angles of candidate locations
+    % ang_pol = 80:2:100;
+    % % azimuth angles of candidate locations 
+    % ang_az = 0:1:359;
+    % % compute candidate DOA vectors and TDOAs
+    % [DOAvec_i, Delta_t_i] = gen_searchGrid(micPos, ang_pol, ang_az, 'spherical', c);
+    % toc;
+
+
+    %%% SRP APPROXIMATION PARAMETERS
+    % compute sampling period and number of samples within TDOA interval
+    [ T, N_mm ] = calc_sampleParam(micPos, w_0, c);
+    % number of auxilary samples (approximation will be computed for all values in vector)
+    N_aux = 2;
+
+
+    %% PROCESSING
+
+    % init results (per source location, frame, number of auxilary samples)
+    % approximation error in dB
+    res.approxErr_dB = zeros(size(true_loc,1), L, length(N_aux));
+    % localization error 
+    res.locErr = zeros(size(true_loc,1), L, length(N_aux)); % res.locErr(:,:,1) refers to  conventional SRP
+    res.locErrRM = zeros(size(true_loc,1), L, length(N_aux)); % res.locErr(:,:,1) refers to  conventional SRP
+
+
+    % tic;
+    Tictoc = zeros(size(true_loc,1), 1);
+    for true_loc_idx = 1:size(true_loc,1)
+    %     tic;
+        disp(['PROCESSING SOURCE LOCATION ' num2str(true_loc_idx)])
+        %%% GENERATE MICROPHONE SIGNALS
+
+        % speech component for selected source     
+    %     x_TDmono = audioread(['x_loc' num2str(true_loc_idx) '.wav']);
+
+    %     fs32 = 32000;
+    % 
+        [x_TDmono, Fs] = audioread('drone.wav');
+
+        x_TDmono = x_TDmono(:, 1);
+
+        fs_new = fs;
+
+        [x_TD, delay] = calc_INPUT_SIGNAL(x_TDmono, micPos, true_loc(true_loc_idx,:), c, Fs, fs_new);
+%         [x_TD_2, delay2] = calc_INPUT_SIGNAL(x_TDmono, micPos, true_loc(true_loc_idx + 1,:), c, Fs, fs_new);
+%         x_TD = x_TD + x_TD_2;
+
+        % noise component
+        [v_TD, fsV] = audioread('phantom_4.wav');
+    %     [v_TD, fsV] = audioread('two_stroke_noise.wav');
+
+    %     x_TD = resample(x_TD, fs32, fs);
+        v_TD = resample(v_TD, fs_new, fsV);
+
+    %     A = size(v_TD, 1) / 2
+    %     plot(-A:(A-1), abs(fftshift(fft(v_TD(:, 1)))))
+
+        v_TD = repmat(v_TD(:, 1), 3, M);
+    %     noise_offset = 0;
+        max_offset = 1000;
+        noise_offset = floor(max_offset*rand(1,M));
+        v_TD = delayseq(v_TD, noise_offset);
+        v_TD = v_TD(1 + max_offset:size(x_TD, 1) + max_offset, :);
+        x_TD = x_TD(1:size(v_TD, 1), :);
+
+        v_TD = randn(size(x_TD, 1) , size(x_TD, 2));
+    %     A = size(v_TD, 1) / 2;
+    %     f = (-A:(A-1)) * fs / (2*A);
+    %     F = fftshift(fft(v_TD));
+    % 
+    %     f_cutoff = 10;
+    %     F_cut = [];
+    %     F_cut = [F_cut; F(1:(A - f_cutoff), :) * 0];
+    %     F_cut = [F_cut; F((A - f_cutoff + 1):(A + f_cutoff), :)];
+    %     F_cut = [F_cut; F((A + f_cutoff + 1):2*A, :) * 0];
+    % 
+    %     v_TD = real(ifft(ifftshift(F_cut)));
+
+        % scale noise component
+%         SNR_dyn = mag2db(dist_at_SNR_0 / norm(true_loc(true_loc_idx, :)));
+%         [x_TD, v_TD] = set_SNR(x_TD, v_TD, SNR_dyn);
+
+        tic;
+        % transform to STFT domain
+        x_STFT  = calc_STFT(x_TD, fs, win, N_STFT, R_STFT, 'onesided');
+%         x_STFT_2  = calc_STFT(x_TD_2, fs, win, N_STFT, R_STFT, 'onesided');
+%         x_STFT = x_STFT + x_STFT_2;
+        
+        v_STFT  = calc_STFT(v_TD, fs, win, N_STFT, R_STFT, 'onesided');
+        
+        dist_at_SNR_0 = 100;
+        humidity = 50;
+        [xr_STFT, SNR_prescale] = Attenuation(x_STFT, fs, norm(true_loc(true_loc_idx, :)), humidity, dist_at_SNR_0);
+        [xr_STFT, v_STFT, scaling] = set_SNR(xr_STFT, v_STFT, SNR_prescale);
+        v_STFT = db2mag(noise_mul) * v_STFT;
+        SNR = SNR_prescale - noise_mul;
+        disp(['SNR ' num2str(SNR)])
+        
+        
+
+        % discard frames that do not contain speech energy (local SNR 15dB below average)
+        l = 1;
+        useframe_idx = [];
+        while length(useframe_idx) < L
+            SNR_local = pow2db(sum(abs(xr_STFT(:,l,1)).^2)/sum(abs(v_STFT(:,l,1)).^2));
+            if SNR_local > SNR - (0)
+                useframe_idx = [useframe_idx, l];
+            end
+            l = l + 1;
+        end
+
+        % final microphone signal in STFT domain
+        y_STFT = xr_STFT(:,useframe_idx,:) + v_STFT(:,useframe_idx,:);
+    %     noise_STFT = v_STFT(:,useframe_idx,:);
+
+    %%
+        %%% PROCESSING
+
+        psi_STFT = calc_FD_GCC(y_STFT, dist_mat);
+    %     npsi_STFT = calc_FD_GCC(noise_STFT);
+
+        fast_mode = 1;
+        fig = 0;%true_loc_idx;%true_loc_idx;
+        proj_dim = 3;
+    %     tic;
+        if fast_mode == 0
+
+            maxIdx_conv = 1;
+            maxIdx_conv_prev = maxIdx_conv;
+            size_prev = 0;
+            xi_mm_samp = cell(L,P);
+
+            for i = 1:size(Delta_t_list, 2)
+
+                Delta_t = Delta_t_list{1, i};
+                DOAvec = DOAvec_list{1, i};
+
+                index = (maxIdx_conv_prev - 1) * size_prev + maxIdx_conv;
+                Delta_t_i = Delta_t(:, :, index);
+                DOAvec_i = DOAvec(:, :, index);
+                size_prev = size(DOAvec, 1);
+
+        %         figure(i);
+        %         hold on
+        %         scatter3(DOAvec_i(:,1),DOAvec_i(:,2),DOAvec_i(:,3));axis equal;
+        %         trimesh(icosphere(2 ^ (2*i)));axis equal; 
+
+                %SRP approximation based on shannon nyquist sampes
+    %             disp('* compute SRP approximation...')
+    %             tic;
+                [SRP_appr, xi_mm_samp] = calc_SRPappr(psi_STFT, omega, T, N_mm, N_aux, Delta_t_i, i, xi_mm_samp);
+    %             SRP_appr = calc_SRPconv(psi_STFT, omega, Delta_t_i)
+        %         SRP_apprFast = calc_SRPapprFast(psi_STFT, omega, T, N_mm, N_aux, Delta_t_i);
+    %             toc;
+
+                figure(fig);
+        %         subplot(1, 2, i)
+                scatter3(DOAvec_i(:, 1), DOAvec_i(:, 2), DOAvec_i(:, 3), 70, transpose(SRP_appr), 'filled'); axis equal;
+                cb = colorbar;
+
+
+        %         title('billiardome')
+        %         grid off
+
+                % init errors
+                approxErr_dB = zeros(L, length(N_aux));
+                locErr = zeros(L, length(N_aux)); % res.locErr(:,1) refers to conventional SRP
+
+
+
+                % compute approximation and localization errors for SRP approximation
+                for N_aux_ind = 1:length(N_aux)
+
+                    maxIdx_conv_prev = index;
+
+                    % localization error
+                    [~, maxIdx_conv] = max(SRP_appr(:,:,N_aux_ind), [], 2);
+        %              [~, maxIdx_conv] = max(SRP_apprFast);
+        %             estim_DOAvec_RM = calc_RobustMax(transpose(SRP_appr), DOAvec_i)
+
+        %             if size(size(DOAvec_i), 2) == 2
+                        estim_DOAvec = DOAvec_i(maxIdx_conv,:);
+        %                 rad2deg(acos(...
+        %                     (estim_DOAvec_RM*transpose(true_DOAvec(true_loc_idx,:)))./(sqrt(sum(estim_DOAvec_RM.^2, 2))*norm(true_DOAvec(true_loc_idx,:)))...
+        %                     ))
+                        true_DOAvec_proj = zeros(1, 3);
+                        true_DOAvec_proj(1:proj_dim) = true_DOAvec(true_loc_idx, 1:proj_dim);
+                        locErr(:,N_aux_ind) = rad2deg(acos(...
+                            (estim_DOAvec*transpose(true_DOAvec_proj))./(sqrt(sum(estim_DOAvec.^2, 2))*norm(true_DOAvec_proj))...
+                            ));
+        %             end
+
+        %             if size(size(DOAvec_i), 2) == 3
+        %                 estim_DOAvec = zeros(size(maxIdx_conv, 1), 3);
+        %                 for j = 1:size(maxIdx_conv, 1)
+        %                     estim_DOAvec(j, :) = DOAvec(maxIdx_conv(j),:, maxIdx_conv_prev(j));
+        %                 end
+        % %                 estim_DOAvec = DOAvec(maxIdx_conv,:, maxIdx_conv_prev);
+        %                 locErr(:,N_aux_ind) = rad2deg(acos(...
+        %                     (estim_DOAvec*transpose(true_DOAvec(true_loc_idx,:)))./(sqrt(sum(estim_DOAvec.^2, 2))*norm(true_DOAvec(true_loc_idx,:)))...
+        %                     ));
+        %             end
+
+                end
+
+            end
+
+        else
+
+            approxErr_dB = zeros(L, length(N_aux));
+            locErr = zeros(L, length(N_aux));
+            locErrRM = zeros(L, length(N_aux));
+            DOAvec = DOAvec_list{1, end};
+    %         tic;
+            [maxIdx_conv,  index, maxIdx_conv_RM] = calc_SRPapprFast(psi_STFT, omega, T, N_mm, N_aux, Delta_t_list, DOAvec_list, fig);
+    %         [maxIdx_convn,  indexn] = calc_SRPapprFast(npsi_STFT, omega, T, N_mm, N_aux, Delta_t_list, DOAvec_list, 2);
+    %         toc;
+
+            estim_DOAvec = DOAvec(maxIdx_conv,:, index);
+            estim_DOAvec_RM = DOAvec(maxIdx_conv_RM,:, index);
+            true_DOAvec_proj = zeros(1, 3);
+            true_DOAvec_proj(1:proj_dim) = true_DOAvec(true_loc_idx,1:proj_dim);
+            locErr(:) = rad2deg(acos(...
+                (estim_DOAvec*transpose(true_DOAvec_proj))./(sqrt(sum(estim_DOAvec.^2, 2))*norm(true_DOAvec_proj))...
+                ));
+            locErrRM(:) = rad2deg(acos(...
+                (estim_DOAvec_RM*transpose(true_DOAvec_proj))./(sqrt(sum(estim_DOAvec_RM.^2, 2))*norm(true_DOAvec_proj))...
+                ));
+        end
+
+    %     toc;
+
+
+        %% SAVE
+
+        res.approxErr_dB(true_loc_idx, :, :) = approxErr_dB;
+        res.locErr(true_loc_idx, :, :) = locErr;
+        res.locErrRM(true_loc_idx, :, :) = locErrRM;
+
+    %     plot(1:100, res.locErr, 'x')
+        Tictoc(true_loc_idx) = toc;
+        SNR_dyn_mat(circ, true_loc_idx) = SNR;
+        circ_err(circ, true_loc_idx) = locErr;
+
+    end
+    % toc;
+    disp(['Mic array configuration: ' mic_config])
+    disp(['SNR: ' num2str(SNR)])
+    disp(['Num of targets: ' num2str(size(true_DOAvec, 1))])
+    disp(['mean time per target: ' num2str(mean(Tictoc))])
+    disp(['var time per target: ' num2str(var(Tictoc))])
+    disp(['mean error: ' num2str(mean(res.locErr))])
+    disp(['var error: ' num2str(var(res.locErr))])
+%     disp(['mean RM error: ' num2str(mean(res.locErrRM))])
+%     disp(['var RM error: ' num2str(var(res.locErrRM))])
+    disp('DONE.')
+    
+    circ_err_mean(circ) = mean(res.locErr);
+    
+end
+%%
+save(fullfile("data/graphs", "circ_pairs123_LPF_500_UAV_phatless_weightless.mat"), "circ_rad", "circ_err_mean", "SNR_dyn_mat", "circ_err");
+
+
+% semilogx(circ_rad, circ_err, 'o','MarkerFaceColor', [0 0.447 0.741])
+% xlabel('Circle Radius (m)')
+% ylabel('Error in 3D Search (Deg)')
+% grid on
+
+% audiowrite(['data/audio/out' num2str(SNR) '.wav'], x_TD + v_TD, fs);
+
+
+%%
+
+% plot_50 = res.locErr(:, :, 2);
+% save(fullfile("data/graphs", "anti_prism_50%.mat"), "plot_50");
+
+% 
+% figure();
+% hold on
+% subplot(1, 3, 1)
+% plot(1:100, load(fullfile("data/graphs", "anti_prism_10%.mat")).plot_10, 'x')
+% ylabel('Angle Error (Deg)')
+% % xaxis off
+% legend('10%')
+% subplot(1, 3, 2)
+% plot(1:100, load(fullfile("data/graphs", "anti_prism_25%.mat")).plot_25, 'x')
+% ylabel('Angle Error (Deg)')
+% % xaxis off
+% legend('25%')
+% subplot(1, 3, 3)
+% plot(1:100, load(fullfile("data/graphs", "anti_prism_50%.mat")).plot_50, 'x')
+% ylabel('Angle Error (Deg)')
+% % xaxis off
+% legend('50%')
